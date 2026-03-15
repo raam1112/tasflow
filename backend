@@ -1,0 +1,761 @@
+<?php
+// ============================================================
+//  TaskFlow - Complete Single File Full Stack App
+//  PHP + MySQL | All-in-one: Auth + API + Dashboard
+// ============================================================
+
+// ── CONFIG ───────────────────────────────────────────────────
+define('DB_HOST', 'your_host_here');        // e.g. sql123.infinityfree.net
+define('DB_NAME', 'your_database_here');    // e.g. if0_12345678_taskflow
+define('DB_USER', 'your_username_here');    // e.g. if0_12345678
+define('DB_PASS', 'your_password_here');    // your database password
+
+// ── DATABASE ─────────────────────────────────────────────────
+function getDB(): PDO {
+    static $pdo = null;
+    if ($pdo === null) {
+        $dsn = 'mysql:host=' . DB_HOST . ';dbname=' . DB_NAME . ';charset=utf8mb4';
+        $pdo = new PDO($dsn, DB_USER, DB_PASS, [
+            PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES   => false,
+        ]);
+    }
+    return $pdo;
+}
+
+// ── AUTO SETUP: Create tables if they don't exist ────────────
+function setupDB(): void {
+    $db = getDB();
+    $db->exec("
+        CREATE TABLE IF NOT EXISTS tf_users (
+            id         INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            name       VARCHAR(100)  NOT NULL,
+            email      VARCHAR(150)  NOT NULL UNIQUE,
+            password   VARCHAR(255)  NOT NULL,
+            avatar     VARCHAR(10)   DEFAULT NULL,
+            created_at DATETIME      DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB;
+
+        CREATE TABLE IF NOT EXISTS tf_tasks (
+            id          INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            user_id     INT UNSIGNED NOT NULL,
+            title       VARCHAR(255) NOT NULL,
+            description TEXT         DEFAULT NULL,
+            priority    ENUM('High','Medium','Low') NOT NULL DEFAULT 'Medium',
+            category    ENUM('Work','Personal','Study','Health') NOT NULL DEFAULT 'Work',
+            status      ENUM('active','done') NOT NULL DEFAULT 'active',
+            due_date    DATE         DEFAULT NULL,
+            created_at  DATETIME     DEFAULT CURRENT_TIMESTAMP,
+            updated_at  DATETIME     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            CONSTRAINT fk_tf_tasks_user FOREIGN KEY (user_id)
+                REFERENCES tf_users(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB;
+    ");
+}
+
+// ── SESSION ──────────────────────────────────────────────────
+if (session_status() === PHP_SESSION_NONE) {
+    session_set_cookie_params(['lifetime'=>0,'path'=>'/','httponly'=>true,'samesite'=>'Strict']);
+    session_start();
+}
+
+function isLoggedIn(): bool   { return !empty($_SESSION['user_id']); }
+function currentUserId(): int { return (int)($_SESSION['user_id'] ?? 0); }
+function currentUserName(): string   { return $_SESSION['user_name']   ?? 'User'; }
+function currentUserAvatar(): string { return $_SESSION['user_avatar'] ?? '?'; }
+
+function loginUser(array $user): void {
+    session_regenerate_id(true);
+    $_SESSION['user_id']     = $user['id'];
+    $_SESSION['user_name']   = $user['name'];
+    $_SESSION['user_email']  = $user['email'];
+    $_SESSION['user_avatar'] = $user['avatar'];
+}
+
+function logoutUser(): void {
+    session_unset(); session_destroy();
+    header('Location: ' . $_SERVER['PHP_SELF']); exit;
+}
+
+function csrfToken(): string {
+    if (empty($_SESSION['csrf_token']))
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    return $_SESSION['csrf_token'];
+}
+
+function verifyCsrf(string $t): bool {
+    return hash_equals($_SESSION['csrf_token'] ?? '', $t);
+}
+
+function h(string $s): string {
+    return htmlspecialchars($s, ENT_QUOTES|ENT_HTML5, 'UTF-8');
+}
+
+// ── HELPERS ──────────────────────────────────────────────────
+function sanitizePriority(string $v): string {
+    return in_array($v,['High','Medium','Low']) ? $v : 'Medium';
+}
+function sanitizeCategory(string $v): string {
+    return in_array($v,['Work','Personal','Study','Health']) ? $v : 'Work';
+}
+function sanitizeStatus(string $v): string {
+    return in_array($v,['active','done']) ? $v : 'active';
+}
+
+function jsonResponse(mixed $data, int $code = 200): never {
+    http_response_code($code);
+    header('Content-Type: application/json');
+    echo json_encode($data);
+    exit;
+}
+
+// ── INIT DB ──────────────────────────────────────────────────
+try { setupDB(); }
+catch (PDOException $e) {
+    die('<div style="font-family:sans-serif;padding:40px;color:#c00">
+        <h2>Database Connection Failed</h2>
+        <p>Please update the DB_HOST, DB_NAME, DB_USER and DB_PASS values at the top of this file.</p>
+        <code>' . h($e->getMessage()) . '</code>
+    </div>');
+}
+
+// ── ROUTE: API ────────────────────────────────────────────────
+if (isset($_GET['api'])) {
+    if (!isLoggedIn()) jsonResponse(['error'=>'Unauthorized'], 401);
+
+    $uid    = currentUserId();
+    $db     = getDB();
+    $method = $_SERVER['REQUEST_METHOD'];
+    $taskId = isset($_GET['id']) ? (int)$_GET['id'] : null;
+    $today  = date('Y-m-d');
+
+    function ownTask(PDO $db, int $id, int $uid): ?array {
+        $s = $db->prepare('SELECT * FROM tf_tasks WHERE id=? AND user_id=?');
+        $s->execute([$id, $uid]);
+        return $s->fetch() ?: null;
+    }
+
+    function jsonBody(): array {
+        return json_decode(file_get_contents('php://input'), true) ?? [];
+    }
+
+    // GET – list tasks + stats
+    if ($method === 'GET') {
+        $where  = ['t.user_id = :uid'];
+        $params = [':uid' => $uid];
+
+        if (!empty($_GET['status']) && $_GET['status'] !== 'all') {
+            $where[] = 't.status = :status';
+            $params[':status'] = sanitizeStatus($_GET['status']);
+        }
+        if (!empty($_GET['priority'])) {
+            $where[] = 't.priority = :priority';
+            $params[':priority'] = sanitizePriority($_GET['priority']);
+        }
+        if (!empty($_GET['category'])) {
+            $where[] = 't.category = :category';
+            $params[':category'] = sanitizeCategory($_GET['category']);
+        }
+        if (!empty($_GET['view'])) {
+            switch ($_GET['view']) {
+                case 'today':
+                    $where[] = 't.due_date = :today'; $params[':today'] = $today; break;
+                case 'upcoming':
+                    $where[] = 't.due_date > :today AND t.status = "active"'; $params[':today'] = $today; break;
+                case 'done':
+                    $where[] = 't.status = "done"'; break;
+            }
+        }
+        if (!empty($_GET['q'])) {
+            $where[] = '(t.title LIKE :q OR t.description LIKE :q)';
+            $params[':q'] = '%' . $_GET['q'] . '%';
+        }
+
+        $sql  = 'SELECT t.* FROM tf_tasks t WHERE ' . implode(' AND ', $where)
+              . ' ORDER BY FIELD(t.priority,"High","Medium","Low"), t.due_date ASC';
+        $stmt = $db->prepare($sql); $stmt->execute($params);
+        $tasks = $stmt->fetchAll();
+
+        $sStat = $db->prepare('SELECT status, COUNT(*) n FROM tf_tasks WHERE user_id=? GROUP BY status');
+        $sStat->execute([$uid]);
+        $stats = ['total'=>0,'done'=>0,'active'=>0,'overdue'=>0];
+        foreach ($sStat->fetchAll() as $r) {
+            $stats['total'] += $r['n'];
+            if ($r['status']==='done')   $stats['done']   = (int)$r['n'];
+            if ($r['status']==='active') $stats['active'] = (int)$r['n'];
+        }
+        $sOver = $db->prepare("SELECT COUNT(*) FROM tf_tasks WHERE user_id=? AND status='active' AND due_date < ?");
+        $sOver->execute([$uid, $today]);
+        $stats['overdue'] = (int)$sOver->fetchColumn();
+
+        jsonResponse(['tasks'=>$tasks,'stats'=>$stats]);
+    }
+
+    // POST – create
+    if ($method === 'POST') {
+        $d = jsonBody(); $title = trim($d['title'] ?? '');
+        if (!$title) jsonResponse(['error'=>'Title required'], 422);
+        $stmt = $db->prepare('INSERT INTO tf_tasks (user_id,title,description,priority,category,status,due_date) VALUES (?,?,?,?,?,?,?)');
+        $stmt->execute([$uid, $title, trim($d['description']??''), sanitizePriority($d['priority']??'Medium'), sanitizeCategory($d['category']??'Work'), 'active', $d['due_date']??null]);
+        $row = $db->prepare('SELECT * FROM tf_tasks WHERE id=?'); $row->execute([$db->lastInsertId()]);
+        jsonResponse(['task'=>$row->fetch()], 201);
+    }
+
+    // PUT – update
+    if ($method === 'PUT') {
+        if (!$taskId || !ownTask($db,$taskId,$uid)) jsonResponse(['error'=>'Not found'],404);
+        $d = jsonBody(); $title = trim($d['title']??'');
+        if (!$title) jsonResponse(['error'=>'Title required'],422);
+        $db->prepare('UPDATE tf_tasks SET title=?,description=?,priority=?,category=?,status=?,due_date=? WHERE id=? AND user_id=?')
+           ->execute([$title,trim($d['description']??''),sanitizePriority($d['priority']??'Medium'),sanitizeCategory($d['category']??'Work'),sanitizeStatus($d['status']??'active'),$d['due_date']??null,$taskId,$uid]);
+        $row = $db->prepare('SELECT * FROM tf_tasks WHERE id=?'); $row->execute([$taskId]);
+        jsonResponse(['task'=>$row->fetch()]);
+    }
+
+    // PATCH – toggle
+    if ($method === 'PATCH') {
+        $task = $taskId ? ownTask($db,$taskId,$uid) : null;
+        if (!$task) jsonResponse(['error'=>'Not found'],404);
+        $newStatus = $task['status']==='done' ? 'active' : 'done';
+        $db->prepare('UPDATE tf_tasks SET status=? WHERE id=?')->execute([$newStatus,$taskId]);
+        jsonResponse(['status'=>$newStatus]);
+    }
+
+    // DELETE
+    if ($method === 'DELETE') {
+        if (!$taskId || !ownTask($db,$taskId,$uid)) jsonResponse(['error'=>'Not found'],404);
+        $db->prepare('DELETE FROM tf_tasks WHERE id=? AND user_id=?')->execute([$taskId,$uid]);
+        jsonResponse(['deleted'=>true]);
+    }
+
+    jsonResponse(['error'=>'Method not allowed'],405);
+}
+
+// ── ROUTE: LOGOUT ─────────────────────────────────────────────
+if (isset($_GET['logout'])) { logoutUser(); }
+
+// ── ROUTE: REGISTER ───────────────────────────────────────────
+$page   = $_GET['page'] ?? 'dashboard';
+$error  = '';
+$success= '';
+
+if ($page === 'register') {
+    if ($_SERVER['REQUEST_METHOD']==='POST') {
+        if (!verifyCsrf($_POST['csrf_token']??'')) {
+            $error = 'Invalid request.';
+        } else {
+            $name     = trim($_POST['name']    ?? '');
+            $email    = trim($_POST['email']   ?? '');
+            $password = trim($_POST['password']?? '');
+            $confirm  = trim($_POST['confirm'] ?? '');
+            if (!$name||!$email||!$password) {
+                $error = 'All fields are required.';
+            } elseif (!filter_var($email,FILTER_VALIDATE_EMAIL)) {
+                $error = 'Invalid email address.';
+            } elseif (strlen($password)<8) {
+                $error = 'Password must be at least 8 characters.';
+            } elseif ($password!==$confirm) {
+                $error = 'Passwords do not match.';
+            } else {
+                $db   = getDB();
+                $stmt = $db->prepare('SELECT id FROM tf_users WHERE email=?');
+                $stmt->execute([$email]);
+                if ($stmt->fetch()) {
+                    $error = 'Email already registered.';
+                } else {
+                    $hash   = password_hash($password, PASSWORD_BCRYPT, ['cost'=>12]);
+                    $words  = explode(' ',$name);
+                    $avatar = strtoupper(substr($words[0],0,1).(isset($words[1])?substr($words[1],0,1):''));
+                    $db->prepare('INSERT INTO tf_users (name,email,password,avatar) VALUES (?,?,?,?)')->execute([$name,$email,$hash,$avatar]);
+                    $success = 'Account created! <a href="?page=login">Log in now →</a>';
+                }
+            }
+        }
+    }
+}
+
+// ── ROUTE: LOGIN ──────────────────────────────────────────────
+if ($page === 'login') {
+    if ($_SERVER['REQUEST_METHOD']==='POST') {
+        if (!verifyCsrf($_POST['csrf_token']??'')) {
+            $error = 'Invalid request.';
+        } else {
+            $email    = trim($_POST['email']   ?? '');
+            $password = trim($_POST['password']?? '');
+            if (!$email||!$password) {
+                $error = 'Please enter your email and password.';
+            } else {
+                $db   = getDB();
+                $stmt = $db->prepare('SELECT * FROM tf_users WHERE email=? LIMIT 1');
+                $stmt->execute([$email]);
+                $user = $stmt->fetch();
+                if ($user && password_verify($password,$user['password'])) {
+                    loginUser($user);
+                    header('Location: ' . $_SERVER['PHP_SELF']); exit;
+                } else {
+                    $error = 'Incorrect email or password.';
+                }
+            }
+        }
+    }
+}
+
+// ── REDIRECT if not logged in ─────────────────────────────────
+if (!isLoggedIn() && !in_array($page,['login','register'])) {
+    header('Location: ?page=login'); exit;
+}
+if (isLoggedIn() && in_array($page,['login','register'])) {
+    header('Location: ' . $_SERVER['PHP_SELF']); exit;
+}
+
+$name   = isLoggedIn() ? h(currentUserName())   : '';
+$avatar = isLoggedIn() ? h(currentUserAvatar()) : '';
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>TaskFlow</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet"/>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#F7F5F0;--surface:#fff;--text:#1A1814;--muted:#7A776E;--border:#E5E2DA;
+  --accent:#2D6A4F;--accent-light:#E8F4EE;--accent-muted:#52B788;
+  --high:#C0392B;--high-bg:#FDF0EF;--med:#D4AC0D;--med-bg:#FEFAE6;
+  --low:#2980B9;--low-bg:#EBF5FB;--done:#888;--done-bg:#F4F4F4;
+  --radius:12px;--radius-sm:8px;
+  font-family:'DM Sans',sans-serif;
+}
+body{background:var(--bg);color:var(--text);min-height:100vh}
+
+/* AUTH */
+.auth-wrap{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.auth-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:36px 32px;width:100%;max-width:420px}
+.brand{font-family:'DM Serif Display',serif;font-size:22px;color:var(--accent);display:block;margin-bottom:24px}
+.auth-title{font-family:'DM Serif Display',serif;font-size:24px;margin-bottom:6px}
+.auth-sub{font-size:14px;color:var(--muted);margin-bottom:24px}
+.field{margin-bottom:16px}
+.field label{display:block;font-size:13px;font-weight:500;color:var(--muted);margin-bottom:6px}
+.field input{width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:14px;font-family:'DM Sans',sans-serif;color:var(--text);outline:none}
+.field input:focus{border-color:var(--accent)}
+.btn-primary{width:100%;padding:11px;background:var(--accent);color:#fff;border:none;border-radius:var(--radius-sm);font-size:15px;font-weight:500;cursor:pointer;font-family:'DM Sans',sans-serif;transition:opacity .15s}
+.btn-primary:hover{opacity:.88}
+.auth-link{font-size:14px;color:var(--muted);margin-top:20px;text-align:center}
+.auth-link a{color:var(--accent);text-decoration:none;font-weight:500}
+.alert{padding:10px 14px;border-radius:var(--radius-sm);font-size:14px;margin-bottom:16px}
+.alert-error{background:var(--high-bg);color:var(--high)}
+.alert-success{background:var(--accent-light);color:var(--accent)}
+.demo-box{background:var(--bg);border:1px dashed var(--border);border-radius:var(--radius-sm);padding:10px 14px;font-size:13px;color:var(--muted);margin-top:16px}
+.demo-box code{background:#e8e6e0;padding:1px 5px;border-radius:4px;font-size:12px;color:var(--text)}
+
+/* DASHBOARD */
+body.app{display:flex;flex-direction:column}
+.topbar{background:var(--surface);border-bottom:1px solid var(--border);padding:0 24px;display:flex;align-items:center;justify-content:space-between;height:60px;position:sticky;top:0;z-index:100}
+.topbar .brand{margin-bottom:0;font-size:20px}
+.topbar-right{display:flex;align-items:center;gap:12px}
+.avatar{width:34px;height:34px;border-radius:50%;background:var(--accent);color:#fff;font-size:13px;font-weight:600;display:flex;align-items:center;justify-content:center}
+.user-name{font-size:14px;font-weight:500}
+.logout-btn{font-size:13px;color:var(--muted);text-decoration:none;padding:5px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);transition:all .15s}
+.logout-btn:hover{border-color:var(--high);color:var(--high)}
+.layout{display:flex;flex:1}
+.sidebar{width:220px;background:var(--surface);border-right:1px solid var(--border);padding:20px 0;flex-shrink:0}
+.main{flex:1;padding:24px;overflow-y:auto;min-width:0}
+.nav-label{font-size:11px;font-weight:600;letter-spacing:1.2px;color:var(--muted);padding:0 20px;margin-bottom:8px;text-transform:uppercase}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;cursor:pointer;font-size:14px;color:var(--muted);transition:background .15s,color .15s;user-select:none}
+.nav-item:hover{background:var(--bg);color:var(--text)}
+.nav-item.active{background:var(--accent-light);color:var(--accent);font-weight:500}
+.nav-icon{width:16px;display:inline-flex;align-items:center;font-size:14px}
+.nav-badge{margin-left:auto;background:var(--accent);color:#fff;font-size:10px;font-weight:600;padding:2px 7px;border-radius:20px}
+.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:20px}
+.stat-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px}
+.stat-label{font-size:12px;color:var(--muted);font-weight:500;margin-bottom:6px}
+.stat-val{font-size:26px;font-weight:600;font-family:'DM Serif Display',serif}
+.stat-sub{font-size:12px;color:var(--accent-muted);margin-top:2px}
+.progress-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px;margin-bottom:20px}
+.progress-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;font-size:14px;font-weight:500}
+.progress-head span:last-child{font-size:13px;color:var(--muted)}
+.progress-wrap{background:var(--bg);border-radius:20px;height:6px;overflow:hidden}
+.progress-fill{height:100%;background:var(--accent);border-radius:20px;transition:width .5s}
+.deadline-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px;margin-bottom:20px}
+.deadline-item{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border)}
+.deadline-item:last-child{border-bottom:none}
+.deadline-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+.dl-title{font-size:14px;font-weight:500}
+.dl-time{font-size:12px;color:var(--muted);margin-left:auto;white-space:nowrap}
+.section-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.section-title{font-family:'DM Serif Display',serif;font-size:18px}
+.toolbar{display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap}
+.search-box{flex:1;min-width:180px;position:relative}
+.search-box input{width:100%;padding:9px 14px 9px 36px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface);font-size:14px;color:var(--text);font-family:'DM Sans',sans-serif;outline:none}
+.search-box input:focus{border-color:var(--accent)}
+.search-icon{position:absolute;left:11px;top:50%;transform:translateY(-50%);color:var(--muted);font-size:14px}
+.filter-btn{padding:9px 14px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface);font-size:13px;color:var(--muted);cursor:pointer;font-family:'DM Sans',sans-serif;transition:all .15s}
+.filter-btn:hover,.filter-btn.active{border-color:var(--accent);color:var(--accent);background:var(--accent-light)}
+.add-btn{padding:9px 16px;background:var(--accent);color:#fff;border:none;border-radius:var(--radius-sm);font-size:14px;font-weight:500;cursor:pointer;font-family:'DM Sans',sans-serif;transition:opacity .15s}
+.add-btn:hover{opacity:.88}
+.tabs{display:flex;gap:4px;margin-bottom:16px}
+.tab{padding:7px 16px;border-radius:var(--radius-sm);font-size:13px;font-weight:500;cursor:pointer;color:var(--muted);background:none;border:none;font-family:'DM Sans',sans-serif;transition:all .15s}
+.tab.active{background:var(--accent);color:#fff}
+.tab:hover:not(.active){background:var(--border)}
+.task-list{display:flex;flex-direction:column;gap:10px}
+.task-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 18px;display:flex;align-items:flex-start;gap:14px;transition:box-shadow .15s;position:relative}
+.task-card:hover{box-shadow:0 2px 12px rgba(0,0,0,.07)}
+.task-card.done-card{opacity:.6}
+.check-circle{width:20px;height:20px;border-radius:50%;border:2px solid var(--border);flex-shrink:0;margin-top:2px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .15s}
+.check-circle:hover{border-color:var(--accent)}
+.check-circle.checked{background:var(--accent);border-color:var(--accent)}
+.check-circle.checked::after{content:'✓';color:#fff;font-size:11px;font-weight:700}
+.task-body{flex:1;min-width:0}
+.task-title{font-size:15px;font-weight:500;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.done-card .task-title{text-decoration:line-through;color:var(--muted)}
+.task-meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.task-desc{font-size:13px;color:var(--muted);margin-top:5px}
+.badge{font-size:11px;font-weight:600;padding:3px 8px;border-radius:20px}
+.badge-high{background:var(--high-bg);color:var(--high)}
+.badge-med{background:var(--med-bg);color:#9a7c0a}
+.badge-low{background:var(--low-bg);color:var(--low)}
+.badge-done{background:var(--done-bg);color:var(--done)}
+.badge-cat{background:var(--accent-light);color:var(--accent)}
+.due-date{font-size:12px;color:var(--muted)}
+.due-date.overdue{color:var(--high);font-weight:500}
+.task-actions{display:flex;gap:6px;opacity:0;transition:opacity .2s}
+.task-card:hover .task-actions{opacity:1}
+.action-btn{width:28px;height:28px;border-radius:6px;border:1px solid var(--border);background:var(--surface);cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:13px;transition:all .15s}
+.action-btn:hover{border-color:var(--accent);background:var(--accent-light)}
+.del-btn:hover{border-color:var(--high)!important;background:var(--high-bg)!important}
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:500;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal{background:var(--surface);border-radius:var(--radius);width:100%;max-width:460px;padding:28px;position:relative}
+.modal-title{font-family:'DM Serif Display',serif;font-size:20px;margin-bottom:20px}
+.close-modal{position:absolute;right:18px;top:18px;width:28px;height:28px;border-radius:6px;border:1px solid var(--border);background:none;cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;color:var(--muted)}
+.form-group{margin-bottom:14px}
+.form-label{font-size:13px;font-weight:500;color:var(--muted);display:block;margin-bottom:6px}
+.form-input{width:100%;padding:9px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:14px;font-family:'DM Sans',sans-serif;color:var(--text);background:var(--surface);outline:none}
+.form-input:focus{border-color:var(--accent)}
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.modal-footer{display:flex;gap:10px;margin-top:20px;justify-content:flex-end}
+.btn-cancel{padding:9px 18px;border:1px solid var(--border);border-radius:var(--radius-sm);background:none;font-size:14px;cursor:pointer;font-family:'DM Sans',sans-serif;color:var(--muted)}
+.btn-save{padding:9px 20px;background:var(--accent);color:#fff;border:none;border-radius:var(--radius-sm);font-size:14px;font-weight:500;cursor:pointer;font-family:'DM Sans',sans-serif}
+.empty{text-align:center;padding:40px 0;color:var(--muted);font-size:14px}
+.toast{position:fixed;bottom:24px;right:24px;background:var(--text);color:#fff;padding:10px 18px;border-radius:var(--radius-sm);font-size:14px;z-index:999;opacity:0;transform:translateY(8px);transition:all .25s;pointer-events:none}
+.toast.show{opacity:1;transform:none}
+@media(max-width:700px){.sidebar{display:none}.stats-grid{grid-template-columns:1fr 1fr}.form-row{grid-template-columns:1fr}}
+</style>
+</head>
+
+<?php if ($page === 'register'): ?>
+<!-- ═══════════════════════════════════════ REGISTER PAGE ═══ -->
+<body>
+<div class="auth-wrap">
+  <div class="auth-card">
+    <span class="brand">✦ TaskFlow</span>
+    <h1 class="auth-title">Create account</h1>
+    <p class="auth-sub">Start managing your tasks today.</p>
+    <?php if ($error):   ?><div class="alert alert-error"><?= h($error) ?></div><?php endif ?>
+    <?php if ($success): ?><div class="alert alert-success"><?= $success ?></div><?php endif ?>
+    <form method="POST">
+      <input type="hidden" name="csrf_token" value="<?= h(csrfToken()) ?>"/>
+      <div class="field"><label>Full Name</label><input type="text" name="name" placeholder="Arjun Kumar" value="<?= h($_POST['name']??'') ?>" required/></div>
+      <div class="field"><label>Email</label><input type="email" name="email" placeholder="you@example.com" value="<?= h($_POST['email']??'') ?>" required/></div>
+      <div class="field"><label>Password</label><input type="password" name="password" placeholder="Min. 8 characters" required/></div>
+      <div class="field"><label>Confirm Password</label><input type="password" name="confirm" placeholder="Repeat password" required/></div>
+      <button type="submit" class="btn-primary">Create Account</button>
+    </form>
+    <p class="auth-link">Already have an account? <a href="?page=login">Log in</a></p>
+  </div>
+</div>
+</body>
+
+<?php elseif ($page === 'login'): ?>
+<!-- ════════════════════════════════════════════ LOGIN PAGE ═══ -->
+<body>
+<div class="auth-wrap">
+  <div class="auth-card">
+    <span class="brand">✦ TaskFlow</span>
+    <h1 class="auth-title">Welcome back</h1>
+    <p class="auth-sub">Log in to your workspace.</p>
+    <?php if ($error): ?><div class="alert alert-error"><?= h($error) ?></div><?php endif ?>
+    <form method="POST">
+      <input type="hidden" name="csrf_token" value="<?= h(csrfToken()) ?>"/>
+      <div class="field"><label>Email</label><input type="email" name="email" placeholder="you@example.com" value="<?= h($_POST['email']??'') ?>" autofocus required/></div>
+      <div class="field"><label>Password</label><input type="password" name="password" placeholder="Your password" required/></div>
+      <button type="submit" class="btn-primary">Log In</button>
+    </form>
+    <p class="auth-link">No account? <a href="?page=register">Register free</a></p>
+  </div>
+</div>
+</body>
+
+<?php else: ?>
+<!-- ══════════════════════════════════════════ DASHBOARD ══════ -->
+<body class="app">
+<header class="topbar">
+  <span class="brand">✦ TaskFlow</span>
+  <div class="topbar-right">
+    <span class="user-name"><?= $name ?></span>
+    <div class="avatar"><?= $avatar ?></div>
+    <a href="?logout=1" class="logout-btn">Sign out</a>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="nav-label">Menu</div>
+    <div class="nav-item active" data-view="all"><span class="nav-icon">◈</span> Dashboard <span class="nav-badge" id="badge-active">0</span></div>
+    <div class="nav-item" data-view="today"><span class="nav-icon">◷</span> Today</div>
+    <div class="nav-item" data-view="upcoming"><span class="nav-icon">◎</span> Upcoming</div>
+    <div class="nav-item" data-view="done"><span class="nav-icon">✓</span> Completed</div>
+    <br/>
+    <div class="nav-label">Priority</div>
+    <div class="nav-item" data-priority="High"><span class="nav-icon" style="color:var(--high)">●</span> High</div>
+    <div class="nav-item" data-priority="Medium"><span class="nav-icon" style="color:var(--med)">●</span> Medium</div>
+    <div class="nav-item" data-priority="Low"><span class="nav-icon" style="color:var(--low)">●</span> Low</div>
+  </aside>
+
+  <main class="main">
+    <div class="stats-grid">
+      <div class="stat-card"><div class="stat-label">Total Tasks</div><div class="stat-val" id="s-total">—</div><div class="stat-sub">All time</div></div>
+      <div class="stat-card"><div class="stat-label">Completed</div><div class="stat-val" id="s-done">—</div><div class="stat-sub" id="s-pct">0% done</div></div>
+      <div class="stat-card"><div class="stat-label">In Progress</div><div class="stat-val" id="s-active">—</div><div class="stat-sub">Active tasks</div></div>
+      <div class="stat-card"><div class="stat-label">Overdue</div><div class="stat-val" style="color:var(--high)" id="s-overdue">—</div><div class="stat-sub">Past deadline</div></div>
+    </div>
+    <div class="progress-card">
+      <div class="progress-head"><span>Overall Progress</span><span id="prog-label">— of — complete</span></div>
+      <div class="progress-wrap"><div class="progress-fill" id="prog-fill" style="width:0%"></div></div>
+    </div>
+    <div class="deadline-card">
+      <div class="section-head" style="margin-bottom:10px"><span class="section-title" style="font-size:16px">Upcoming Deadlines</span></div>
+      <div id="deadline-list"><p style="font-size:13px;color:var(--muted)">Loading…</p></div>
+    </div>
+    <div>
+      <div class="section-head">
+        <span class="section-title" id="section-label">All Tasks</span>
+        <button class="add-btn" id="open-modal">+ Add Task</button>
+      </div>
+      <div class="toolbar">
+        <div class="search-box"><span class="search-icon">⌕</span><input type="text" id="search-input" placeholder="Search tasks…"/></div>
+        <button class="filter-btn active" data-cat="All">All</button>
+        <button class="filter-btn" data-cat="Work">Work</button>
+        <button class="filter-btn" data-cat="Personal">Personal</button>
+        <button class="filter-btn" data-cat="Study">Study</button>
+        <button class="filter-btn" data-cat="Health">Health</button>
+      </div>
+      <div class="tabs">
+        <button class="tab active" data-status="all">All</button>
+        <button class="tab" data-status="active">Active</button>
+        <button class="tab" data-status="done">Done</button>
+      </div>
+      <div class="task-list" id="task-list"><p style="font-size:13px;color:var(--muted);padding:24px 0">Loading tasks…</p></div>
+    </div>
+  </main>
+</div>
+
+<!-- MODAL -->
+<div class="modal-overlay" id="modal-overlay">
+  <div class="modal" id="modal-box">
+    <button class="close-modal" id="close-modal">✕</button>
+    <div class="modal-title" id="modal-title">New Task</div>
+    <div class="form-group"><label class="form-label">Task Title *</label><input class="form-input" type="text" id="f-title" placeholder="e.g. Complete project report"/></div>
+    <div class="form-group"><label class="form-label">Description</label><input class="form-input" type="text" id="f-desc" placeholder="Optional notes…"/></div>
+    <div class="form-row">
+      <div class="form-group"><label class="form-label">Priority</label><select class="form-input" id="f-priority"><option>High</option><option selected>Medium</option><option>Low</option></select></div>
+      <div class="form-group"><label class="form-label">Category</label><select class="form-input" id="f-cat"><option>Work</option><option>Personal</option><option>Study</option><option>Health</option></select></div>
+    </div>
+    <div class="form-group"><label class="form-label">Deadline</label><input class="form-input" type="date" id="f-date"/></div>
+    <div class="modal-footer">
+      <button class="btn-cancel" id="cancel-modal">Cancel</button>
+      <button class="btn-save" id="save-task">Save Task</button>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+'use strict';
+const API = '?api=1';
+const state = { tasks:[], stats:{}, activeView:'all', catFilter:'All', statusFilter:'all', priorityFilter:null, searchQuery:'', editId:null };
+const today = new Date().toISOString().split('T')[0];
+const $  = id => document.getElementById(id);
+const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+async function api(method, params={}, body=null) {
+  const url = new URL(API, location.href);
+  Object.entries(params).forEach(([k,v]) => url.searchParams.set(k,v));
+  const opts = { method, headers:{'Content-Type':'application/json'} };
+  if (body) opts.body = JSON.stringify(body);
+  const res  = await fetch(url, opts);
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'Request failed');
+  return data;
+}
+
+async function loadTasks() {
+  const params = {};
+  if (state.priorityFilter)         params.priority = state.priorityFilter;
+  if (state.catFilter !== 'All')    params.category = state.catFilter;
+  if (state.statusFilter !== 'all') params.status   = state.statusFilter;
+  if (state.activeView !== 'all')   params.view     = state.activeView;
+  if (state.searchQuery)            params.q        = state.searchQuery;
+  try {
+    const data  = await api('GET', params);
+    state.tasks = data.tasks; state.stats = data.stats;
+    renderTasks(); renderStats(); renderDeadlines();
+  } catch(e) { $('task-list').innerHTML = `<p class="empty">Error: ${e.message}</p>`; }
+}
+
+function isOverdue(t) { return t.status !== 'done' && t.due_date && t.due_date < today; }
+function fmtDate(d) { const [y,m,day]=d.split('-'); return new Date(+y,+m-1,+day).toLocaleDateString('en-IN',{day:'numeric',month:'short'}); }
+const priClass = { High:'badge-high', Medium:'badge-med', Low:'badge-low' };
+
+function renderTasks() {
+  if (!state.tasks.length) { $('task-list').innerHTML='<div class="empty">📋 No tasks found</div>'; return; }
+  $('task-list').innerHTML = state.tasks.map(t => `
+    <div class="task-card ${t.status==='done'?'done-card':''}">
+      <div class="check-circle ${t.status==='done'?'checked':''}" data-id="${t.id}"></div>
+      <div class="task-body">
+        <div class="task-title">${esc(t.title)}</div>
+        <div class="task-meta">
+          <span class="badge ${t.status==='done'?'badge-done':priClass[t.priority]}">${t.status==='done'?'Done':t.priority}</span>
+          <span class="badge badge-cat">${t.category}</span>
+          ${t.due_date?`<span class="due-date ${isOverdue(t)?'overdue':''}">⏱ ${isOverdue(t)?'Overdue: ':''}${fmtDate(t.due_date)}</span>`:''}
+        </div>
+        ${t.description?`<div class="task-desc">${esc(t.description)}</div>`:''}
+      </div>
+      <div class="task-actions">
+        <button class="action-btn edit-btn" data-id="${t.id}">✎</button>
+        <button class="action-btn del-btn"  data-id="${t.id}">✕</button>
+      </div>
+    </div>`).join('');
+}
+
+function renderStats() {
+  const {total,done,active,overdue} = state.stats;
+  const pct = total ? Math.round(done/total*100) : 0;
+  $('s-total').textContent=total; $('s-done').textContent=done;
+  $('s-active').textContent=active; $('s-overdue').textContent=overdue;
+  $('s-pct').textContent=pct+'% done';
+  $('prog-label').textContent=`${done} of ${total} complete`;
+  $('prog-fill').style.width=pct+'%';
+  $('badge-active').textContent=active;
+}
+
+function renderDeadlines() {
+  const upcoming = state.tasks.filter(t=>t.status!=='done'&&t.due_date&&t.due_date>=today).sort((a,b)=>a.due_date.localeCompare(b.due_date)).slice(0,4);
+  const colors = {High:'#C0392B',Medium:'#D4AC0D',Low:'#2980B9'};
+  const dl = $('deadline-list');
+  if (!upcoming.length) { dl.innerHTML='<p style="font-size:13px;color:var(--muted)">No upcoming deadlines.</p>'; return; }
+  dl.innerHTML = upcoming.map(t => {
+    const d = new Date(t.due_date+'T00:00:00');
+    const diff = Math.ceil((d - new Date(today+'T00:00:00'))/86400000);
+    const when = diff===0?'Today':diff===1?'Tomorrow':`In ${diff} days`;
+    return `<div class="deadline-item"><div class="deadline-dot" style="background:${colors[t.priority]}"></div><div><div class="dl-title">${esc(t.title)}</div><div style="font-size:12px;color:var(--muted)">${t.category}</div></div><div class="dl-time">${when}</div></div>`;
+  }).join('');
+}
+
+function openModal(task=null) {
+  state.editId = task ? task.id : null;
+  $('modal-title').textContent = task ? 'Edit Task' : 'New Task';
+  $('f-title').value    = task?.title       ?? '';
+  $('f-desc').value     = task?.description ?? '';
+  $('f-priority').value = task?.priority    ?? 'Medium';
+  $('f-cat').value      = task?.category    ?? 'Work';
+  $('f-date').value     = task?.due_date    ?? '';
+  $('modal-overlay').classList.add('open');
+  setTimeout(()=>$('f-title').focus(),80);
+}
+
+function closeModal() { $('modal-overlay').classList.remove('open'); }
+
+async function saveTask() {
+  const title = $('f-title').value.trim();
+  if (!title) { $('f-title').focus(); return; }
+  const body = { title, description:$('f-desc').value.trim(), priority:$('f-priority').value, category:$('f-cat').value, due_date:$('f-date').value||null };
+  try {
+    if (state.editId) {
+      body.status = state.tasks.find(t=>t.id===state.editId)?.status ?? 'active';
+      await api('PUT',{id:state.editId},body); toast('Task updated');
+    } else {
+      await api('POST',{},body); toast('Task created');
+    }
+    closeModal(); loadTasks();
+  } catch(e) { toast(e.message, true); }
+}
+
+async function toggleDone(id) { try { await api('PATCH',{id}); loadTasks(); } catch(e) { toast(e.message,true); } }
+async function deleteTask(id) {
+  if (!confirm('Delete this task?')) return;
+  try { await api('DELETE',{id}); toast('Task deleted'); loadTasks(); } catch(e) { toast(e.message,true); }
+}
+
+function toast(msg, isError=false) {
+  const el = $('toast');
+  el.textContent = msg;
+  el.style.background = isError ? '#C0392B' : '#1A1814';
+  el.classList.add('show');
+  setTimeout(()=>el.classList.remove('show'), 2500);
+}
+
+// Event delegation
+$('task-list').addEventListener('click', e => {
+  const chk  = e.target.closest('.check-circle');
+  const edit = e.target.closest('.edit-btn');
+  const del  = e.target.closest('.del-btn');
+  if (chk)  { toggleDone(+chk.dataset.id); return; }
+  if (del)  { deleteTask(+del.dataset.id); return; }
+  if (edit) { const t=state.tasks.find(t=>t.id===+edit.dataset.id); if(t) openModal(t); }
+});
+
+document.querySelectorAll('.nav-item[data-view]').forEach(el => {
+  el.addEventListener('click', () => {
+    state.activeView='all'; state.activeView=el.dataset.view; state.priorityFilter=null;
+    document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active')); el.classList.add('active');
+    const labels={all:'All Tasks',today:"Today's Tasks",upcoming:'Upcoming',done:'Completed'};
+    $('section-label').textContent = labels[el.dataset.view]||'Tasks';
+    loadTasks();
+  });
+});
+
+document.querySelectorAll('.nav-item[data-priority]').forEach(el => {
+  el.addEventListener('click', () => {
+    state.priorityFilter=el.dataset.priority; state.activeView='all';
+    document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active')); el.classList.add('active');
+    $('section-label').textContent=el.dataset.priority+' Priority'; loadTasks();
+  });
+});
+
+document.querySelectorAll('.filter-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    state.catFilter=btn.dataset.cat;
+    document.querySelectorAll('.filter-btn').forEach(b=>b.classList.remove('active')); btn.classList.add('active');
+    loadTasks();
+  });
+});
+
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    state.statusFilter=tab.dataset.status;
+    document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active')); tab.classList.add('active');
+    loadTasks();
+  });
+});
+
+let st;
+$('search-input').addEventListener('input', () => {
+  clearTimeout(st); st=setTimeout(()=>{ state.searchQuery=$('search-input').value.trim(); loadTasks(); },300);
+});
+
+$('open-modal').addEventListener('click',  ()=>openModal());
+$('close-modal').addEventListener('click', closeModal);
+$('cancel-modal').addEventListener('click',closeModal);
+$('save-task').addEventListener('click',   saveTask);
+$('modal-overlay').addEventListener('click', e=>{ if(e.target===$('modal-overlay')) closeModal(); });
+document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeModal(); });
+
+loadTasks();
+</script>
+</body>
+<?php endif; ?>
+</html>
